@@ -1,0 +1,219 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container">
+    <div class="row">
+        <!-- Country Selection -->
+        <div class="col-md-3">
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="card-title mb-0">Chọn quốc gia</h5>
+                </div>
+                <div class="card-body">
+                    <form id="reportForm">
+                        <div class="mb-3">
+                            <select class="form-select" id="country" required>
+                                <option value="">Chọn quốc gia...</option>
+                                {% for country in countries %}
+                                <option value="{{ country }}">{{ country }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <button type="submit" class="btn btn-primary w-100">Tạo báo cáo</button>
+                    </form>
+                    
+                    <!-- Export buttons -->
+                    <div class="mt-3">
+                        <button id="exportPDF" class="btn btn-outline-secondary w-100" disabled>
+                            <i class="bi bi-file-pdf"></i> Tải báo cáo PDF
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Report Content -->
+        <div class="col-md-9">
+            <div id="reportContent" style="display: none;">
+                <!-- Trend Chart -->
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h5 class="card-title mb-0">Xu hướng thất nghiệp</h5>
+                    </div>
+                    <div class="card-body">
+                        <img id="trendChart" class="img-fluid" style="width: 100%;">
+                    </div>
+                </div>
+
+                <!-- Most Affected Groups -->
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h5 class="card-title mb-0">Nhóm chịu ảnh hưởng nhiều nhất</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <h6>Theo trung bình 3 năm gần đây:</h6>
+                                <div id="mostAffectedAvg" class="alert alert-info"></div>
+                            </div>
+                            <div class="col-md-6">
+                                <h6>Theo giá trị cao nhất:</h6>
+                                <div id="mostAffectedMax" class="alert alert-warning"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Trend Analysis -->
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="card-title mb-0">Phân tích xu hướng</h5>
+                    </div>
+                    <div class="card-body">
+                        <div id="trendAnalysis"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Loading spinner -->
+            <div id="loadingSpinner" class="text-center" style="display: none;">
+                <div class="spinner-border text-primary" role="status">
+                    <span class="visually-hidden">Loading...</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const reportForm = document.getElementById('reportForm');
+    const reportContent = document.getElementById('reportContent');
+    const loadingSpinner = document.getElementById('loadingSpinner');
+    const exportPDF = document.getElementById('exportPDF');
+    let currentReportData = null;
+    
+    async function generateReport() {
+        const country = document.getElementById('country').value;
+        if (!country) return;
+        
+        try {
+            // Show loading spinner
+            reportContent.style.display = 'none';
+            loadingSpinner.style.display = 'block';
+            exportPDF.disabled = true;
+            
+            const response = await fetch('/api/quick-report', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ country })
+            });
+            
+            const result = await response.json();
+            
+            if (result.success) {
+                currentReportData = result;
+                
+                // Update trend chart
+                document.getElementById('trendChart').src = 'data:image/png;base64,' + result.trend_chart;
+                
+                // Update most affected groups
+                document.getElementById('mostAffectedAvg').innerHTML = `
+                    ${result.most_affected.by_average.sex} - ${result.most_affected.by_average.age_group}<br>
+                    <strong>Trung bình: ${result.most_affected.by_average.average.toFixed(2)}%</strong>
+                `;
+                
+                document.getElementById('mostAffectedMax').innerHTML = `
+                    ${result.most_affected.by_max.sex} - ${result.most_affected.by_max.age_group}<br>
+                    <strong>Cao nhất: ${result.most_affected.by_max.max.toFixed(2)}%</strong>
+                `;
+                
+                // Update trend analysis
+                const trendAnalysisHtml = Object.entries(result.trends).map(([group, trend]) => {
+                    const direction = trend.direction === 'increase' ? '📈' :
+                                    trend.direction === 'decrease' ? '📉' : '➡️';
+                    const color = trend.direction === 'increase' ? 'danger' :
+                                 trend.direction === 'decrease' ? 'success' : 'secondary';
+                    return `
+                        <div class="alert alert-${color} mb-2">
+                            <h6 class="alert-heading">${group} ${direction}</h6>
+                            <p class="mb-0">
+                                ${trend.direction === 'increase' ? 'Tăng' : 
+                                  trend.direction === 'decrease' ? 'Giảm' : 'Ổn định'}
+                                ${trend.magnitude.toFixed(2)}%<br>
+                                Độ biến thiên: ${trend.volatility.toFixed(2)}
+                            </p>
+                        </div>
+                    `;
+                }).join('');
+                
+                document.getElementById('trendAnalysis').innerHTML = trendAnalysisHtml;
+                
+                // Show report content and enable export
+                reportContent.style.display = 'block';
+                exportPDF.disabled = false;
+            } else {
+                alert(result.error || 'Error generating report');
+            }
+        } catch (error) {
+            console.error('Error:', error);
+            alert('Error generating report');
+        } finally {
+            loadingSpinner.style.display = 'none';
+        }
+    }
+    
+    // Handle form submission
+    reportForm.addEventListener('submit', function(e) {
+        e.preventDefault();
+        generateReport();
+    });
+    
+    // Handle PDF export
+    exportPDF.addEventListener('click', async function() {
+        if (!currentReportData) return;
+
+        // Chỉ lấy đúng 2 trường cần thiết cho analysis_data
+        const analysisData = {
+            most_affected: currentReportData.most_affected,
+            trends: currentReportData.trends
+        };
+
+        try {
+            const response = await fetch('/api/export-report', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    country: document.getElementById('country').value,
+                    chart_data: document.getElementById('trendChart').src,
+                    analysis_data: analysisData
+                })
+            });
+
+            if (response.ok) {
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `unemployment_report_${document.getElementById('country').value}.pdf`;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                a.remove();
+            } else {
+                alert('Error exporting PDF');
+            }
+        } catch (error) {
+            console.error('Error:', error);
+            alert('Error exporting PDF');
+        }
+    });
+});
+</script>
+{% endblock %} 

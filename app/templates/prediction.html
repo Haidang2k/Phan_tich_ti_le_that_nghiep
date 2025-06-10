@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="row justify-content-center">
+        <!-- Left Column - Input Form -->
+        <div class="col-md-4">
+            <div class="card shadow border-0 rounded-3">
+                <div class="card-header bg-gradient text-white py-3" style="background: linear-gradient(45deg, #2196F3, #1976D2);">
+                    <h4 class="card-title mb-0 text-center">
+                        <i class="fas fa-chart-line me-2"></i>Thông số dự đoán
+                    </h4>
+                </div>
+                <div class="card-body p-4">
+                    <form id="predictionForm">
+                        <!-- Country Selection -->
+                        <div class="mb-4">
+                            <label for="country" class="form-label fw-bold">
+                                <i class="fas fa-globe-asia me-2"></i>Quốc gia
+                            </label>
+                            <select class="form-select form-select-lg shadow-sm" id="country" name="country" required>
+                                <option value="">Chọn quốc gia...</option>
+                                {% for country in countries %}
+                                <option value="{{ country }}">{{ country }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+
+                        <!-- Sex Selection -->
+                        <div class="mb-4">
+                            <label for="sex" class="form-label fw-bold">
+                                <i class="fas fa-venus-mars me-2"></i>Giới tính
+                            </label>
+                            <select class="form-select form-select-lg shadow-sm" id="sex" name="sex" required>
+                                <option value="">Chọn giới tính...</option>
+                                {% for sex_option in sexes %}
+                                <option value="{{ sex_option }}">{{ sex_option }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+
+                        <!-- Age Group Selection -->
+                        <div class="mb-4">
+                            <label for="ageGroup" class="form-label fw-bold">
+                                <i class="fas fa-users me-2"></i>Nhóm tuổi
+                            </label>
+                            <select class="form-select form-select-lg shadow-sm" id="ageGroup" name="ageGroup" required>
+                                <option value="">Chọn nhóm tuổi...</option>
+                                {% for age_group in age_groups %}
+                                <option value="{{ age_group }}">{{ age_group }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+
+                        <button type="submit" class="btn btn-primary btn-lg w-100 mt-3 shadow-sm" style="background: linear-gradient(45deg, #2196F3, #1976D2); border: none;">
+                            <i class="fas fa-chart-bar me-2"></i>Dự đoán
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Column - Results -->
+        <div class="col-md-8">
+            <!-- Loading Spinner -->
+            <div id="loadingSpinner" class="text-center my-5 d-none">
+                <div class="spinner-border text-primary" role="status">
+                    <span class="visually-hidden">Loading...</span>
+                </div>
+                <p class="mt-2">Đang xử lý dự đoán...</p>
+            </div>
+
+            <!-- Results Content -->
+            <div id="resultContent" class="d-none">
+                <!-- Chart Card -->
+                <div class="card shadow border-0 rounded-3 mb-4">
+                    <div class="card-header bg-gradient text-white py-3" style="background: linear-gradient(45deg, #2196F3, #1976D2);">
+                        <h4 class="card-title mb-0">
+                            <i class="fas fa-chart-line me-2"></i>Biểu đồ dự đoán
+                        </h4>
+                    </div>
+                    <div class="card-body p-4">
+                        <img id="predictionChart" class="img-fluid rounded shadow-sm" alt="Prediction Chart">
+                    </div>
+                </div>
+
+                <!-- Data Table Card -->
+                <div class="card shadow border-0 rounded-3">
+                    <div class="card-header bg-gradient text-white py-3" style="background: linear-gradient(45deg, #2196F3, #1976D2);">
+                        <h4 class="card-title mb-0">
+                            <i class="fas fa-table me-2"></i>Dữ liệu chi tiết
+                        </h4>
+                    </div>
+                    <div class="card-body p-4">
+                        <div class="table-responsive">
+                            <table class="table table-hover">
+                                <thead class="table-light">
+                                    <tr>
+                                        <th>Năm</th>
+                                        <th>Tỷ lệ thất nghiệp (%)</th>
+                                        <th>Phân loại</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="predictionTable"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const predictionForm = document.getElementById('predictionForm');
+    const resultContent = document.getElementById('resultContent');
+    const loadingSpinner = document.getElementById('loadingSpinner');
+    const predictionChart = document.getElementById('predictionChart');
+    const predictionTable = document.getElementById('predictionTable');
+
+    predictionForm.addEventListener('submit', async function(e) {
+        e.preventDefault();
+
+        // Show loading spinner
+        resultContent.classList.add('d-none');
+        loadingSpinner.classList.remove('d-none');
+
+        // Get form data
+        const data = {
+            country: document.getElementById('country').value,
+            sex: document.getElementById('sex').value,
+            age_group: document.getElementById('ageGroup').value
+        };
+
+        try {
+            const response = await fetch('/predict', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(data)
+            });
+
+            const result = await response.json();
+
+            if (result.success) {
+                // Update chart
+                predictionChart.src = 'data:image/png;base64,' + result.chart_url;
+
+                // Update table
+                predictionTable.innerHTML = '';
+                for (let i = 0; i < result.table_data.Năm.length; i++) {
+                    const year = result.table_data.Năm[i];
+                    const rate = result.table_data['Tỷ lệ thất nghiệp (%)'][i];
+                    const type = year <= 2024 ? 'Lịch sử' : 'Dự đoán';
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>${year}</td>
+                        <td>${rate.toFixed(2)}%</td>
+                        <td><span class="badge ${type === 'Lịch sử' ? 'bg-info' : 'bg-warning'} rounded-pill">${type}</span></td>
+                    `;
+                    predictionTable.appendChild(row);
+                }
+
+                // Show results
+                resultContent.classList.remove('d-none');
+            } else {
+                alert(result.error || 'Có lỗi xảy ra khi dự đoán');
+            }
+        } catch (error) {
+            console.error('Error:', error);
+            alert('Có lỗi xảy ra khi dự đoán');
+        } finally {
+            loadingSpinner.classList.add('d-none');
+        }
+    });
+});
+</script>
+{% endblock %} 

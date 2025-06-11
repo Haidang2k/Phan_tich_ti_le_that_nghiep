@@ -24,8 +24,6 @@ import sys
 from functools import lru_cache
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-import joblib
-import matplotlib.ticker as mticker
 
 # Set console output encoding to UTF-8
 if sys.stdout.encoding != 'utf-8':
@@ -100,12 +98,6 @@ try:
 except Exception as e:
     print(f"Error during model initialization: {str(e)}")
 
-# Load scaler, encoder, model khi khởi tạo app
-scaler_rate = joblib.load('scaler_rate.save')
-scaler_year = joblib.load('scaler_year.save')
-label_encoders = joblib.load('label_encoders.save')
-model = load_model('best_lstm_model.h5')
-
 def create_sequences(data, time_steps=5):
     """Tạo chuỗi dữ liệu cho LSTM"""
     X = []
@@ -147,379 +139,605 @@ def prediction():
         flash(f"Error loading prediction page: {str(e)}", "error")
         return render_template('prediction.html')
 
-@main_bp.route('/predict', methods=['POST'])
+@main_bp.route('/predict', methods=['POST']) #API dự đoán
 def predict():
+    global df_cache
     try:
         data = request.get_json()
         country = data.get('country')
         sex = data.get('sex')
         age_group = data.get('age_group')
-        # Encode input
+        
+        if model is None:
+            return jsonify({
+                'success': False,
+                'error': 'Model has not been initialized'
+            })
+        
+        # Sử dụng dữ liệu đã cache
+        if df_cache is None:
+            df_cache = load_data()
+            
+        df_filtered = df_cache[
+            (df_cache['country_name'] == country) & 
+            (df_cache['sex'] == sex) & 
+            (df_cache['age_group'] == age_group)
+        ]
+        
+        if df_filtered.empty:
+            return jsonify({
+                'success': False,
+                'error': 'No data found for selected filters'
+            })
+        
+        # Lấy dữ liệu lịch sử
+        historical_years = [str(year) for year in range(2014, 2025)]
+        historical_rates = df_filtered[historical_years].values.flatten()
+        
+        # Chuẩn bị dữ liệu cho dự đoán
         country_encoded = label_encoders['country_name'].transform([country])[0]
         sex_encoded = label_encoders['sex'].transform([sex])[0]
         age_group_encoded = label_encoders['age_group'].transform([age_group])[0]
-        # Lấy dữ liệu lịch sử
-        df = pd.read_csv("global_unemployment_data.csv")
-        df_filtered = df[(df['country_name'] == country) & (df['sex'] == sex) & (df['age_group'] == age_group)]
-        historical_years = [str(year) for year in range(2014, 2025)]
-        historical_rates = df_filtered[historical_years].values.flatten()
-        # Chuẩn hóa dữ liệu lịch sử
-        rates_scaled = scaler_rate.transform(historical_rates.reshape(-1, 1)).flatten()
-        years_scaled = scaler_year.transform(np.array(range(2014, 2025)).reshape(-1, 1)).flatten()
-        # Tạo chuỗi đầu vào
-        time_steps = 5
-        last_seq = []
-        for i in range(-time_steps, 0):
-            last_seq.append([
+        
+        # Chuẩn hóa dữ liệu
+        rates_scaled = scaler_rate.transform(historical_rates.reshape(-1, 1))
+        years = np.array(range(2014, 2025)).reshape(-1, 1)
+        years_scaled = scaler_year.transform(years)
+        
+        # Tạo chuỗi input cho LSTM (5 năm gần nhất)
+        sequence_length = 5
+        input_sequence = []
+        for i in range(sequence_length):
+            idx = -(sequence_length - i)
+            input_sequence.append([
                 country_encoded,
                 sex_encoded,
                 age_group_encoded,
-                years_scaled[i],
-                rates_scaled[i]
+                years_scaled[idx][0],
+                rates_scaled[idx][0]
             ])
-        last_seq = np.array(last_seq)
-        # Hàm dự đoán multi-step tối ưu
-        def predict_future_lstm(model, last_sequence, time_steps, future_steps, scaler_year, scaler_rate, start_year=2024, ensemble_size=10, noise_level=0.01):
+        input_sequence = np.array(input_sequence)
+        
+        def predict_future_optimized(last_sequence, time_steps, future_steps, num_samples=5):
             predictions = []
+            confidence_intervals = []
             current_sequence = last_sequence.copy()
-            for i in range(future_steps):
+            
+            for year_idx in range(future_steps):
+                # Tạo ensemble predictions với ít mẫu hơn
                 ensemble_preds = []
-                for _ in range(ensemble_size):
-                    noisy_seq = current_sequence + np.random.normal(0, noise_level, current_sequence.shape)
-                    pred = model.predict(noisy_seq[np.newaxis, :, :], verbose=0)[0, 0]
-                    ensemble_preds.append(pred)
-                pred_mean_scaled = np.mean(ensemble_preds)
-                pred_mean = scaler_rate.inverse_transform([[pred_mean_scaled]])[0, 0]
+                for _ in range(num_samples):
+                    pred = model.predict(current_sequence.reshape(1, time_steps, 5), verbose=0)
+                    pred_original = scaler_rate.inverse_transform([[pred[0][0]]])[0][0]
+                    ensemble_preds.append(pred_original)
+                
+                # Tính trung bình và độ lệch chuẩn của ensemble
+                pred_mean = np.mean(ensemble_preds)
+                pred_std = np.std(ensemble_preds)
+                
+                # Áp dụng các ràng buộc
+                pred_mean = max(0, min(pred_mean, 100))
+                
+                # Thêm vào kết quả
                 predictions.append(pred_mean)
-                # Cập nhật chuỗi cho năm tiếp theo
-                new_row = current_sequence[-1].copy()
-                next_year = start_year + i + 1
-                next_year_scaled = scaler_year.transform([[next_year]])[0, 0]
-                new_row[-2] = next_year_scaled
-                new_row[-1] = pred_mean_scaled
+                confidence_intervals.append(pred_std)
+                
+                # Cập nhật sequence cho lần dự đoán tiếp theo
+                new_row = [
+                    country_encoded,
+                    sex_encoded,
+                    age_group_encoded,
+                    scaler_year.transform([[2025 + year_idx]])[0][0],
+                    scaler_rate.transform([[pred_mean]])[0][0]
+                ]
                 current_sequence = np.vstack((current_sequence[1:], new_row))
-            return predictions
-
-        # Dự đoán cho 5 năm tới
-        future_predictions = predict_future_lstm(model, last_seq, time_steps, 5, scaler_year, scaler_rate)
+            
+            return predictions, confidence_intervals
         
-        # Tạo plot
-        plt.figure(figsize=(10, 6))
-        years = list(range(2014, 2025)) + list(range(2025, 2030))
-        rates = historical_rates.tolist() + future_predictions
+        # Dự đoán cho 5 năm tiếp theo (2025-2029)
+        predictions, confidence_intervals = predict_future_optimized(
+            input_sequence, sequence_length, 5, num_samples=5
+        )
         
-        # Plot historical data
-        plt.plot(years[:11], rates[:11], 'b-', label='Historical Data')
+        # Tạo biểu đồ
+        plt.figure(figsize=(12, 6))
+        years = list(range(2014, 2030))
         
-        # Plot predictions
-        plt.plot(years[10:], rates[10:], 'r--', label='Predictions')
+        # Vẽ dữ liệu lịch sử
+        plt.plot(years[:11], historical_rates, 'o-', label='Dữ liệu lịch sử', color='blue', linewidth=2)
         
-        # Add confidence interval
-        std_dev = np.std(future_predictions)
-        plt.fill_between(years[10:], 
-                        [r - 1.96*std_dev for r in rates[10:]],
-                        [r + 1.96*std_dev for r in rates[10:]],
-                        color='r', alpha=0.2)
+        # Vẽ dự đoán và khoảng tin cậy
+        pred_years = years[10:]
+        pred_values = [historical_rates[-1]] + predictions
+        confidence = np.array([0] + confidence_intervals)
         
-        plt.title(f'Unemployment Rate Prediction for {country} - {sex} - {age_group}')
-        plt.xlabel('Year')
-        plt.ylabel('Unemployment Rate (%)')
+        plt.plot(pred_years, pred_values, 'o--', label='Dự đoán', color='red', linewidth=2)
+        plt.fill_between(pred_years,
+                        np.array(pred_values) - 2*confidence,
+                        np.array(pred_values) + 2*confidence,
+                        color='red', alpha=0.1, label='Khoảng tin cậy (95%)')
+        
+        plt.title(f'Tỷ lệ thất nghiệp - {country}')
+        plt.xlabel('Năm')
+        plt.ylabel('Tỷ lệ (%)')
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.legend()
         
-        # Format y-axis as percentage
-        plt.gca().yaxis.set_major_formatter(mticker.PercentFormatter())
+        # Format trục x
+        plt.gca().xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: int(x)))
         
-        # Create plot URL
-        plot_url = create_plot()
+        # Tạo URL cho biểu đồ
+        chart_url = create_plot()
+        
+        # Tạo dữ liệu cho bảng
+        table_data = {
+            'Năm': years,
+            'Tỷ lệ thất nghiệp (%)': list(historical_rates) + predictions,
+            'Độ không chắc chắn (±%)': [0]*11 + confidence_intervals
+        }
         
         return jsonify({
-            'plot': plot_url,
-            'predictions': future_predictions,
-            'status': 'success'
+            'success': True,
+            'chart_url': chart_url,
+            'table_data': table_data,
+            'predictions': predictions,
+            'confidence_intervals': confidence_intervals
         })
         
     except Exception as e:
+        print(f"Error in prediction: {str(e)}")
         return jsonify({
-            'status': 'error',
-            'message': str(e)
+            'success': False,
+            'error': str(e)
         })
 
 @main_bp.route('/explore')
 def explore():
-    """Explore page"""
+    """Data exploration page"""
     try:
-        # Get available options for exploration
-        countries = [country for country in label_encoders['country_name'].classes_]
-        sexes = [sex for sex in label_encoders['sex'].classes_]
-        age_groups = [age_group for age_group in label_encoders['age_group'].classes_]
+        # Load data
+        df = pd.read_csv("global_unemployment_data.csv")
+        
+        # Get unique values for filters - sử dụng đúng tên cột
+        countries = sorted(df['country_name'].unique().tolist())
+        sexes = sorted(df['sex'].unique().tolist())
+        age_groups = sorted(df['age_group'].unique().tolist())
+        years = list(range(2014, 2025))
         
         return render_template('explore.html',
                              countries=countries,
                              sexes=sexes,
-                             age_groups=age_groups)
-                             
+                             age_groups=age_groups,
+                             years=years)
     except Exception as e:
-        flash(f"Error loading explore page: {str(e)}", "error")
+        print(f"Error loading exploration page: {str(e)}")
+        flash(f"Error loading exploration page: {str(e)}", "error")
         return render_template('explore.html')
 
-@main_bp.route('/api/explore', methods=['POST'])
+@main_bp.route('/api/explore', methods=['POST']) #API khám phá dữ liệu
 def explore_data():
+    """Handle data exploration requests"""
     try:
         data = request.get_json()
-        country = data.get('country')
+        countries = data.get('countries', [])
         sex = data.get('sex')
         age_group = data.get('age_group')
+        start_year = int(data.get('start_year', 2014))
+        end_year = int(data.get('end_year', 2024))
+        chart_type = data.get('chart_type', 'line')
         
-        # Lấy dữ liệu
+        # Load and filter data
         df = pd.read_csv("global_unemployment_data.csv")
-        df_filtered = df[(df['country_name'] == country) & 
-                        (df['sex'] == sex) & 
-                        (df['age_group'] == age_group)]
         
-        # Tạo các biểu đồ
-        historical_years = [str(year) for year in range(2014, 2025)]
-        historical_rates = df_filtered[historical_years].values.flatten()
+        # Convert year columns to string
+        year_cols = [str(year) for year in range(start_year, end_year + 1)]
         
-        # 1. Line plot
-        plt.figure(figsize=(10, 6))
-        plt.plot(range(2014, 2025), historical_rates, 'b-', marker='o')
-        plt.title(f'Unemployment Rate Trend for {country} - {sex} - {age_group}')
-        plt.xlabel('Year')
-        plt.ylabel('Unemployment Rate (%)')
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.gca().yaxis.set_major_formatter(mticker.PercentFormatter())
-        line_plot_url = create_plot()
+        # Filter data
+        mask = df['country_name'].isin(countries)
+        if sex:
+            mask &= df['sex'] == sex
+        if age_group:
+            mask &= df['age_group'] == age_group
+            
+        filtered_df = df[mask]
         
-        # 2. Box plot
-        plt.figure(figsize=(10, 6))
-        sns.boxplot(data=df_filtered[historical_years])
-        plt.title(f'Unemployment Rate Distribution for {country} - {sex} - {age_group}')
-        plt.xlabel('Year')
-        plt.ylabel('Unemployment Rate (%)')
-        plt.xticks(rotation=45)
-        plt.gca().yaxis.set_major_formatter(mticker.PercentFormatter())
-        box_plot_url = create_plot()
+        if filtered_df.empty:
+            return jsonify({
+                'success': False,
+                'error': 'No data found for the selected filters'
+            })
         
-        # 3. Statistics
-        stats = {
-            'mean': float(np.mean(historical_rates)),
-            'median': float(np.median(historical_rates)),
-            'std': float(np.std(historical_rates)),
-            'min': float(np.min(historical_rates)),
-            'max': float(np.max(historical_rates))
-        }
+        # Create plot based on chart type
+        plt.figure(figsize=(12, 6))
+        
+        if chart_type == 'line':
+            for country in countries:
+                country_data = filtered_df[filtered_df['country_name'] == country]
+                if not country_data.empty:
+                    # Convert year columns to numeric and handle any non-numeric values
+                    values = pd.to_numeric(country_data[year_cols].iloc[0], errors='coerce')
+                    plt.plot(year_cols, values, marker='o', label=country)
+            
+            plt.title('Tỷ lệ thất nghiệp theo thời gian')
+            plt.xlabel('Năm')
+            plt.ylabel('Tỷ lệ (%)')
+            plt.xticks(rotation=45)
+            
+        elif chart_type == 'bar':
+            # For bar chart, we'll show the latest year by default
+            latest_year = str(end_year)
+            country_values = []
+            
+            for country in countries:
+                country_data = filtered_df[filtered_df['country_name'] == country]
+                if not country_data.empty:
+                    # Convert to numeric and handle any non-numeric values
+                    value = pd.to_numeric(country_data[latest_year].iloc[0], errors='coerce')
+                    country_values.append(float(value))
+            
+            plt.bar(countries, country_values)
+            plt.title(f'Tỷ lệ thất nghiệp năm {latest_year}')
+            plt.xlabel('Quốc gia')
+            plt.ylabel('Tỷ lệ (%)')
+            plt.xticks(rotation=45)
+        
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True)
+        plt.tight_layout()
+        
+        # Create chart URL
+        chart_url = create_plot()
+        
+        # Prepare data for table
+        # Convert numeric columns to float and round to 2 decimal places
+        numeric_cols = year_cols
+        for col in numeric_cols:
+            filtered_df[col] = pd.to_numeric(filtered_df[col], errors='coerce').round(2)
+        
+        table_data = filtered_df[['country_name', 'sex', 'age_group'] + year_cols].to_dict('records')
         
         return jsonify({
-            'line_plot': line_plot_url,
-            'box_plot': box_plot_url,
-            'stats': stats,
-            'status': 'success'
+            'success': True,
+            'chart_url': chart_url,
+            'table_data': table_data
         })
         
     except Exception as e:
+        print(f"Error in data exploration: {str(e)}")
         return jsonify({
-            'status': 'error',
-            'message': str(e)
+            'success': False,
+            'error': str(e)
         })
 
-@main_bp.route('/api/export-csv', methods=['POST'])
+@main_bp.route('/api/export-csv', methods=['POST']) #API xuất dữ liệu ra CSV
 def export_csv():
+    """Export filtered data to CSV"""
     try:
         data = request.get_json()
-        country = data.get('country')
+        countries = data.get('countries', [])
         sex = data.get('sex')
         age_group = data.get('age_group')
+        start_year = int(data.get('start_year', 2014))
+        end_year = int(data.get('end_year', 2024))
         
-        # Lấy dữ liệu
+        # Load and filter data
         df = pd.read_csv("global_unemployment_data.csv")
-        df_filtered = df[(df['country_name'] == country) & 
-                        (df['sex'] == sex) & 
-                        (df['age_group'] == age_group)]
+        year_cols = [str(year) for year in range(start_year, end_year + 1)]
         
-        # Tạo file CSV
-        output = io.StringIO()
-        df_filtered.to_csv(output, index=False)
+        # Filter data
+        if countries:  # Nếu có chọn quốc gia
+            mask = df['country_name'].isin(countries)
+        else:  # Nếu không chọn quốc gia nào, lấy tất cả
+            mask = pd.Series([True] * len(df))
+            
+        if sex and sex != "Tất cả":
+            mask &= df['sex'] == sex
+        if age_group and age_group != "Tất cả":
+            mask &= df['age_group'] == age_group
+            
+        filtered_df = df[mask]
+        
+        if filtered_df.empty:
+            return jsonify({
+                'success': False,
+                'error': 'No data found for the selected filters'
+            })
+        
+        # Chọn các cột cần xuất
+        export_cols = ['country_name', 'sex', 'age_group'] + year_cols
+        
+        # Chuyển đổi các cột số thành float và làm tròn
+        for col in year_cols:
+            filtered_df[col] = pd.to_numeric(filtered_df[col], errors='coerce').round(2)
+        
+        # Tạo buffer để lưu CSV
+        csv_buffer = io.StringIO()
+        filtered_df[export_cols].to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+        csv_buffer.seek(0)
+        
+        # Tạo tên file với timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'unemployment_data_{timestamp}.csv'
+        
+        # Chuyển đổi StringIO thành BytesIO để gửi file
+        output = io.BytesIO()
+        output.write(csv_buffer.getvalue().encode('utf-8-sig'))
         output.seek(0)
         
         return send_file(
-            io.BytesIO(output.getvalue().encode('utf-8')),
+            output,
             mimetype='text/csv',
             as_attachment=True,
-            download_name=f'unemployment_data_{country}_{sex}_{age_group}.csv'
+            download_name=filename,
+            max_age=0
         )
         
     except Exception as e:
+        print(f"Error exporting CSV: {str(e)}")
         return jsonify({
-            'status': 'error',
-            'message': str(e)
+            'success': False,
+            'error': str(e)
         })
 
 @main_bp.route('/quick-report')
 def quick_report():
-    """Quick report page"""
+    """Quick country report page"""
     try:
-        # Get available options for report
-        countries = [country for country in label_encoders['country_name'].classes_]
-        sexes = [sex for sex in label_encoders['sex'].classes_]
-        age_groups = [age_group for age_group in label_encoders['age_group'].classes_]
+        # Load data
+        df = pd.read_csv("global_unemployment_data.csv")
         
-        return render_template('quick_report.html',
-                             countries=countries,
-                             sexes=sexes,
-                             age_groups=age_groups)
-                             
+        # Get unique countries
+        countries = sorted(df['country_name'].unique().tolist())
+        
+        return render_template('quick_report.html', countries=countries)
     except Exception as e:
+        print(f"Error loading quick report page: {str(e)}")
         flash(f"Error loading quick report page: {str(e)}", "error")
         return render_template('quick_report.html')
 
-@main_bp.route('/api/quick-report', methods=['POST'])
+@main_bp.route('/api/quick-report', methods=['POST']) #API tạo báo cáo nhanh
 def generate_quick_report():
+    """Generate quick report for a country"""
     try:
         data = request.get_json()
         country = data.get('country')
-        sex = data.get('sex')
-        age_group = data.get('age_group')
         
-        # Lấy dữ liệu
+        if not country:
+            return jsonify({
+                'success': False,
+                'error': 'Country is required'
+            })
+        
+        # Load data
         df = pd.read_csv("global_unemployment_data.csv")
-        df_filtered = df[(df['country_name'] == country) & 
-                        (df['sex'] == sex) & 
-                        (df['age_group'] == age_group)]
+        year_cols = [str(year) for year in range(2014, 2025)]
         
-        # Tạo các biểu đồ
-        historical_years = [str(year) for year in range(2014, 2025)]
-        historical_rates = df_filtered[historical_years].values.flatten()
+        # Filter data for the selected country
+        country_data = df[df['country_name'] == country]
         
-        # 1. Line plot
-        plt.figure(figsize=(10, 6))
-        plt.plot(range(2014, 2025), historical_rates, 'b-', marker='o')
-        plt.title(f'Unemployment Rate Trend for {country} - {sex} - {age_group}')
-        plt.xlabel('Year')
-        plt.ylabel('Unemployment Rate (%)')
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.gca().yaxis.set_major_formatter(mticker.PercentFormatter())
-        line_plot_url = create_plot()
+        if country_data.empty:
+            return jsonify({
+                'success': False,
+                'error': 'No data found for the selected country'
+            })
         
-        # 2. Box plot
-        plt.figure(figsize=(10, 6))
-        sns.boxplot(data=df_filtered[historical_years])
-        plt.title(f'Unemployment Rate Distribution for {country} - {sex} - {age_group}')
-        plt.xlabel('Year')
-        plt.ylabel('Unemployment Rate (%)')
-        plt.xticks(rotation=45)
-        plt.gca().yaxis.set_major_formatter(mticker.PercentFormatter())
-        box_plot_url = create_plot()
+        # Create trend chart
+        plt.figure(figsize=(12, 6))
         
-        # 3. Statistics
-        stats = {
-            'mean': float(np.mean(historical_rates)),
-            'median': float(np.median(historical_rates)),
-            'std': float(np.std(historical_rates)),
-            'min': float(np.min(historical_rates)),
-            'max': float(np.max(historical_rates))
+        # Plot lines for each demographic group
+        for _, row in country_data.iterrows():
+            label = f"{row['sex']} - {row['age_group']}"
+            values = [float(row[year]) for year in year_cols]
+            plt.plot(year_cols, values, marker='o', label=label)
+        
+        plt.title(f'Tỷ lệ thất nghiệp tại {country} (2014-2024)')
+        plt.xlabel('Năm')
+        plt.ylabel('Tỷ lệ (%)')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True)
+        plt.tight_layout()
+        
+        # Convert plot to base64 string
+        trend_chart_url = create_plot()
+        
+        # Analyze most affected groups
+        recent_years = [str(year) for year in range(2022, 2025)]
+        recent_data = country_data[['sex', 'age_group'] + recent_years].copy()
+        recent_data['average'] = recent_data[recent_years].astype(float).mean(axis=1)
+        recent_data['max'] = recent_data[recent_years].astype(float).max(axis=1)
+        
+        most_affected = {
+            'by_average': recent_data.loc[recent_data['average'].idxmax()].to_dict(),
+            'by_max': recent_data.loc[recent_data['max'].idxmax()].to_dict()
         }
         
+        # Analyze trends
+        trends = {}
+        for _, row in country_data.iterrows():
+            values = [float(row[year]) for year in year_cols]
+            
+            # Calculate trend
+            start_value = values[0]
+            end_value = values[-1]
+            diff = end_value - start_value
+            
+            # Calculate volatility
+            std_dev = np.std(values)
+            
+            trend_info = {
+                'direction': 'increase' if diff > 0 else 'decrease' if diff < 0 else 'stable',
+                'magnitude': abs(diff),
+                'volatility': std_dev,
+                'values': values
+            }
+            
+            trends[f"{row['sex']} - {row['age_group']}"] = trend_info
+        
         return jsonify({
-            'line_plot': line_plot_url,
-            'box_plot': box_plot_url,
-            'stats': stats,
-            'status': 'success'
+            'success': True,
+            'trend_chart': trend_chart_url,
+            'most_affected': most_affected,
+            'trends': trends,
+            'raw_data': country_data[['sex', 'age_group'] + year_cols].to_dict('records')
         })
         
     except Exception as e:
+        print(f"Error generating report: {str(e)}")
         return jsonify({
-            'status': 'error',
-            'message': str(e)
+            'success': False,
+            'error': str(e)
         })
 
-@main_bp.route('/api/export-report', methods=['POST'])
+@main_bp.route('/api/export-report', methods=['POST']) #API xuất báo cáo ra PDF
 def export_report():
+    """Export report as PDF with Vietnamese font support"""
     try:
         data = request.get_json()
         country = data.get('country')
-        sex = data.get('sex')
-        age_group = data.get('age_group')
-        line_plot = data.get('line_plot')
-        box_plot = data.get('box_plot')
-        stats = data.get('stats')
+        chart_data = data.get('chart_data')
+        analysis_data = data.get('analysis_data')
         
-        # Tạo PDF
+        if not all([country, chart_data, analysis_data]):
+            return jsonify({
+                'success': False,
+                'error': 'Thiếu dữ liệu cần thiết để tạo báo cáo'
+            })
+        
+        # Log dữ liệu đầu vào để debug
+        print("Country:", country)
+        print("Analysis data:", analysis_data)
+        
+        # Tạo buffer để lưu PDF
         buffer = BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter)
-        styles = getSampleStyleSheet()
-        elements = []
         
-        # Title
+        # Tạo PDF document với kích thước A4
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            rightMargin=72,
+            leftMargin=72,
+            topMargin=72,
+            bottomMargin=72
+        )
+        
+        # Đăng ký font Unicode DejaVuSerif
+        font_path = 'app/static/fonts/DejaVuSerif.ttf'
+        if not os.path.exists(font_path):
+            print(f"Font file not found: {font_path}")
+        else:
+            pdfmetrics.registerFont(TTFont('DejaVuSerif', font_path))
+        # Lấy styles mặc định và tạo custom styles với font Unicode
+        styles = getSampleStyleSheet()
         title_style = ParagraphStyle(
             'CustomTitle',
             parent=styles['Heading1'],
+            fontName='DejaVuSerif',
             fontSize=24,
-            spaceAfter=30
+            spaceAfter=30,
+            alignment=1
         )
-        elements.append(Paragraph(f'Unemployment Rate Report for {country}', title_style))
-        elements.append(Paragraph(f'Sex: {sex}', styles['Normal']))
-        elements.append(Paragraph(f'Age Group: {age_group}', styles['Normal']))
-        elements.append(Spacer(1, 20))
-        
-        # Line Plot
-        elements.append(Paragraph('Historical Trend', styles['Heading2']))
-        img_data = base64.b64decode(line_plot)
-        img = Image(BytesIO(img_data), width=400, height=300)
-        elements.append(img)
-        elements.append(Spacer(1, 20))
-        
-        # Box Plot
-        elements.append(Paragraph('Distribution Analysis', styles['Heading2']))
-        img_data = base64.b64decode(box_plot)
-        img = Image(BytesIO(img_data), width=400, height=300)
-        elements.append(img)
-        elements.append(Spacer(1, 20))
-        
-        # Statistics
-        elements.append(Paragraph('Statistical Summary', styles['Heading2']))
-        stats_data = [
-            ['Metric', 'Value'],
-            ['Mean', f"{stats['mean']:.2f}%"],
-            ['Median', f"{stats['median']:.2f}%"],
-            ['Standard Deviation', f"{stats['std']:.2f}%"],
-            ['Minimum', f"{stats['min']:.2f}%"],
-            ['Maximum', f"{stats['max']:.2f}%"]
-        ]
-        table = Table(stats_data)
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 14),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-            ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
-            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 1), (-1, -1), 12),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        elements.append(table)
-        
+        heading_style = ParagraphStyle(
+            'CustomHeading',
+            parent=styles['Heading2'],
+            fontName='DejaVuSerif',
+            fontSize=16,
+            spaceBefore=20,
+            spaceAfter=12
+        )
+        body_style = ParagraphStyle(
+            'CustomBody',
+            parent=styles['Normal'],
+            fontName='DejaVuSerif',
+            fontSize=12,
+            spaceBefore=6,
+            spaceAfter=6
+        )
+        # Bắt đầu tạo nội dung PDF
+        story = []
+        # Thêm tiêu đề
+        title_text = f'Báo cáo thất nghiệp - {country}'
+        story.append(Paragraph(title_text, title_style))
+        story.append(Spacer(1, 20))
+        # Thêm biểu đồ vào PDF
+        if chart_data:
+            try:
+                if 'base64,' in chart_data:
+                    chart_data = chart_data.split('base64,')[1]
+                img_data = BytesIO(base64.b64decode(chart_data))
+                img = Image(img_data)
+                img.drawHeight = 4*inch
+                img.drawWidth = 7*inch
+                story.append(img)
+                story.append(Spacer(1, 20))
+            except Exception as e:
+                print(f"Error processing chart image: {str(e)}")
+        # Thêm phần nhóm chịu ảnh hưởng nhiều nhất
+        story.append(Paragraph('Nhóm chịu ảnh hưởng nhiều nhất', heading_style))
+        if 'most_affected' in analysis_data and 'by_average' in analysis_data['most_affected']:
+            avg_group = analysis_data['most_affected']['by_average']
+            avg_text = f"""<b>Theo trung bình 3 năm gần đây:</b><br/>
+                         {avg_group['sex']} - {avg_group['age_group']}<br/>
+                         Trung bình: {float(avg_group['average']):.2f}%"""
+            story.append(Paragraph(avg_text, body_style))
+            story.append(Spacer(1, 10))
+        if 'most_affected' in analysis_data and 'by_max' in analysis_data['most_affected']:
+            max_group = analysis_data['most_affected']['by_max']
+            max_text = f"""<b>Theo giá trị cao nhất:</b><br/>
+                         {max_group['sex']} - {max_group['age_group']}<br/>
+                         Cao nhất: {float(max_group['max']):.2f}%"""
+            story.append(Paragraph(max_text, body_style))
+        story.append(Spacer(1, 20))
+        # Thêm phần phân tích xu hướng
+        story.append(Paragraph('Phân tích xu hướng', heading_style))
+        if 'trends' in analysis_data:
+            for group, trend in analysis_data['trends'].items():
+                direction_text = 'Tăng' if trend['direction'] == 'increase' else 'Giảm' if trend['direction'] == 'decrease' else 'Ổn định'
+                magnitude = float(trend['magnitude']) if isinstance(trend['magnitude'], (int, float)) else 0.0
+                volatility = float(trend['volatility']) if isinstance(trend['volatility'], (int, float)) else 0.0
+                trend_text = f"""<b>{group}</b><br/>
+                               {direction_text} {magnitude:.2f}%<br/>
+                               Độ biến thiên: {volatility:.2f}"""
+                story.append(Paragraph(trend_text, body_style))
+                story.append(Spacer(1, 10))
+        # Thêm timestamp
+        story.append(Spacer(1, 30))
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        footer_style = ParagraphStyle(
+            'Footer',
+            parent=styles['Normal'],
+            fontName='DejaVuSerif',
+            fontSize=8,
+            textColor=colors.gray,
+            alignment=1
+        )
+        story.append(Paragraph(f"Báo cáo được tạo lúc: {timestamp}", footer_style))
         # Build PDF
-        doc.build(elements)
+        try:
+            doc.build(story)
+        except Exception as e:
+            print(f"Error building PDF: {str(e)}")
+            return jsonify({'success': False, 'error': f'Lỗi khi build PDF: {str(e)}'})
         buffer.seek(0)
-        
-        return send_file(
+        # Trả về file PDF
+        response = send_file(
             buffer,
             mimetype='application/pdf',
             as_attachment=True,
-            download_name=f'unemployment_report_{country}_{sex}_{age_group}.pdf'
+            download_name=f'bao_cao_that_nghiep_{country}.pdf'
         )
-        
+        # Thêm header để tránh cache
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
     except Exception as e:
+        print(f"Error generating PDF: {str(e)}")
         return jsonify({
-            'status': 'error',
-            'message': str(e)
+            'success': False,
+            'error': f'Lỗi khi tạo PDF: {str(e)}'
         })
 
 @main_bp.route('/favicon.ico')
 def favicon():
     return send_from_directory(os.path.join(current_app.root_path, 'static'),
-                             'favicon.ico', mimetype='image/vnd.microsoft.icon') 
+                               'favicon.ico', mimetype='image/vnd.microsoft.icon') 

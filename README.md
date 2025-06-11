@@ -1,4 +1,5 @@
 Giao diện dự đoán
+
 ![image](https://github.com/user-attachments/assets/e04c0cad-ab7d-4dbf-9aae-45c7e1462ea3)
 
 Giao diện phân tích dữ liệu
